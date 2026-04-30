@@ -1,0 +1,7 @@
+langchain
+langchain-community
+langchain-core
+pymupdf
+docx2txt
+# Add your LLM provider if needed, for example:
+# langchain-openai

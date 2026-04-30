@@ -1,0 +1,13 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local Vector Database (FAISS)
+faiss_index/
+
+# OS files
+.DS_Store
