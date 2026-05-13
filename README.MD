@@ -15,6 +15,9 @@ pip install langchain langchain-community langchain-huggingface sentence-transfo
 6. Issues - install the libraries for doc2txt loader.
 7. Install git in the root dir /ask - git init -b main
 8. create a .gitignore file to ignore files that need not be committed.
+
+
+Design decisions
 9. Update your create_vector_store function to include the specific model you want to use. Common choices include sentence-transformers/all-MiniLM-L6-v2 (fast and light) or sentence-transformers/all-mpnet-base-v2 (higher accuracy)
 10. When you ask a query, the vector store - 1. Embeds query, 2. Compares vectors, 3. Returns closest chunks.
 11. RAG is defined by three core stages, all of which are present in this script:Retrieval: vector_store.similarity_search(query) takes the question, turns it into a vector, and finds the most relevant text chunks from your local FAISS database.Augmentation: The RetrievalQA chain takes those retrieved chunks and "stuffs" them into a prompt as additional context for the AI. Generation: Ollama (Llama 3) uses that specific context to generate a factual answer, rather than just guessing from its own internal training data.
@@ -25,6 +28,10 @@ pip install langchain langchain-community langchain-huggingface sentence-transfo
   - During an API Call (/ask): When a user asks a question, the endpoint reaching out to state["qa_chain"] pulls the already-warmed-up model from RAM instantly. This allows your RAG application to respond in milliseconds.
   - During an Upload (/upload): When a new document is sent to the server, the route grabs the database directly out of state["vector_store"], modifies it with the new text vectors, saves it back into the state locker, and updates the chain instantly without restarting the server.
 15. Removed if __name__ == "__main__": main(): FastAPI applications use web servers like uvicorn as their entry points rather than executing standard script loops.
+16. Ragas is completely free and open-source. However, it is an Evaluation Framework, not a continuous logging tool.Instead of measuring time (like we did above), Ragas scores quality:Faithfulness: Is the AI making things up, or is it strictly using your file?Answer Relevancy: Did the AI actually answer your specific question?Context Precision: Did FAISS catch the correct document chunks?Because Ragas uses an LLM to grade your outputs, running it inside your FastAPI endpoints will double your latency (since it requires a second local LLM call just to score the first answer). The best practice is to run Ragas as a standalone test script against your saved data when testing changes to your chunk sizes.
+17. Implement a free, continuous, open-source RAG dashboard with a visual interface, you can look into Langfuse (which has a free, self-hosted, MIT-licensed tier).
+18. Performance Metrics
+The API tracks three time-based latency metrics using Python’s built-in time module to monitor performance:Retrieval Latency (retrieval_latency_seconds): Measures how long it takes to embed your plain-text query (via HuggingFace) and search the local FAISS index for the top 3 closest chunks. High latency indicates CPU processing bottlenecks or a bloated vector index.Generation Latency (generation_latency_seconds): Tracks the execution time for your local Ollama instance (llama3) to process the context and synthesize a response. This represents the primary computational bottleneck of the system.Total Latency (total_latency_seconds): Measures the complete end-to-end request loop from the moment the /ask HTTP request hits the endpoint until the final JSON payload is dispatched.
 
 ToDo:
 - Add docker image

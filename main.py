@@ -1,7 +1,7 @@
 import os
-import shutil
+import time
+import json
 import logging
-import tempfile
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
@@ -12,6 +12,9 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain.chains import RetrievalQA
+
+# Import Langfuse's native callback handler for LangChain
+from langfuse.callback import CallbackHandler
 
 #-----logging configuration-----
 logging.basicConfig(
@@ -24,6 +27,8 @@ logger = logging.getLogger(__name__)
 # Global container to keep loaded models and index in memory across API calls
 state = {}
 INDEX_PATH = "faiss_index"
+# Target append-only evaluation log file for Ragas
+RAGAS_EVAL_FILE = "ragas_eval_data.jsonl"
 
 def load_and_split_documents(file_path, file_extension, chunk_size=500, chunk_overlap=100):
     logger.info(f"Loading document from: {file_path} with extension: {file_extension}")
@@ -96,6 +101,10 @@ async def lifespan(app: FastAPI):
 
     state["llm"] = llm
     yield
+    # Ensure all remaining background tracking logs are pushed out on shutdown
+    if "langfuse_handler" in state:
+        logger.info("Flushing background monitoring traces...")
+        state["langfuse_handler"].flush() [1.21]
     state.clear()
 
 app = FastAPI(lifespan=lifespan)
@@ -109,63 +118,99 @@ async def upload_document(file: UploadFile = File(...)):
     if not embeddings:
         raise HTTPException(status_code=503, detail="Embeddings engine unavailable.")
 
-    # Extract target file extension
-    file_ext = os.path.splitext(file.filename)[1].lower()
+    file_ext = os.path.splitext(file.filename).lower()
     if file_ext not in [".docx", ".pdf", ".txt", ".md"]:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_ext}")
 
-    # Write binary uploaded data out to a managed temporary file block
+    import tempfile
+    import shutil
     with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
         shutil.copyfileobj(file.file, temp_file)
         temp_file_path = temp_file.name
 
     try:
-        # Load and split the document using the dynamic pipeline
         chunks = load_and_split_documents(temp_file_path, file_ext)
         if not chunks:
-            raise HTTPException(status_code=400, detail="Failed to parse document text or no text found.")
+            raise HTTPException(status_code=400, detail="Failed to parse document text.")
 
-        # If a store already exists, add chunks directly. Otherwise, build it fresh.
         if state.get("vector_store") is not None:
             logger.info("Adding chunks to existing local vector index...")
             state["vector_store"].add_documents(chunks)
         else:
             state["vector_store"] = create_vector_store(chunks, embeddings)
 
-        # Save the vector store for future use
         state["vector_store"].save_local(INDEX_PATH)
         logger.info(f"Vector store created and saved successfully.")
 
-        # Update or create the running Retrieval Chain instance with the newest data
         state["qa_chain"] = RetrievalQA.from_chain_type(
             llm=state["llm"],
             chain_type="stuff",
             retriever=state["vector_store"].as_retriever(search_kwargs={"k": 3})
         )
 
-        return {"status": "success", "message": f"Successfully parsed and indexed {file.filename}"}
+        return {"status": "success", "message": f"Successfully indexed {file.filename}"}
 
     finally:
-        # Clean up temporary disk space immediately 
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
 @app.post("/ask")
 async def ask_question(request: QueryRequest):
-    if not state.get("qa_chain"):
-        raise HTTPException(status_code=400, detail="No documents have been indexed yet. Please upload a file first.")
+    if not state.get("qa_chain") or not state.get("vector_store"):
+        raise HTTPException(status_code=400, detail="No documents indexed yet.")
     
     try:
+        start_total = time.time()
         query = request.question
-        logger.info(f"Retrieving relevant chunks for query: '{query}'")
         
-        # Generate the answer using RAG
-        response = state["qa_chain"].invoke(query)
+        # 1. Initialize Langfuse dynamic callbacks on-demand per request
+        langfuse_handler = CallbackHandler()
+        
+        # 2. Measure Retrieval Latency & extract context chunks
+        start_retrieval = time.time()
+        logger.info(f"Retrieving relevant chunks for query: '{query}'")
+        relevant_chunks = state["vector_store"].similarity_search(query, k=3)
+        retrieval_latency = round(time.time() - start_retrieval, 3)
+        
+        # Format the retrieved texts for the Ragas pipeline requirement
+        contexts = [chunk.page_content for chunk in relevant_chunks]
+        
+        # 3. Measure Generation Latency passing the Langfuse callback directly to the invocation loop
+        start_generation = time.time()
+        response = state["qa_chain"].invoke(
+            query, 
+            config={"callbacks": [langfuse_handler]} # Hooks everything into your Langfuse UI automatically
+        )
+        generation_latency = round(time.time() - start_generation, 3)
+        
+        total_latency = round(time.time() - start_total, 3)
+        answer = response["result"]
+
+        # 4. Construct dataset record strictly matching the evaluation format for Ragas
+        eval_record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "question": query,          # Maps to Ragas 'question'
+            "answer": answer,            # Maps to Ragas 'answer'
+            "contexts": contexts,        # Maps to Ragas 'contexts'
+            "metrics": {
+                "retrieval_latency_seconds": retrieval_latency,
+                "generation_latency_seconds": generation_latency,
+                "total_latency_seconds": total_latency
+            }
+        }
+
+        # 5. Append-only file writer ('a' flag ensures data is preserved and not overwritten)
+        with open(RAGAS_EVAL_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(eval_record) + "\n")
+
+        logger.info(f"Log appended to {RAGAS_EVAL_FILE}. Total latency: {total_latency}s")
         
         return {
             "question": query,
-            "answer": response["result"]
+            "answer": answer,
+            "metrics": eval_record["metrics"]
         }
     except Exception as e:
-        logger.error(f"Error handling query execution: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error during answer generation.")
+        logger.error(f"Error handling query: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error.")
+
