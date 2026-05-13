@@ -3,5 +3,6 @@ langchain-community
 langchain-core
 pymupdf
 docx2txt
+langchain-ollama-0.6.2
 # Add your LLM provider if needed, for example:
 # langchain-openai
