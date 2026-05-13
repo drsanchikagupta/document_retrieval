@@ -6,3 +6,6 @@ docx2txt
 langchain-ollama-0.6.2
 # Add your LLM provider if needed, for example:
 # langchain-openai
+fastapi-0.128.8
+uvicorn-0.39.0
+python-multipart-0.0.5
