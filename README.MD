@@ -89,7 +89,7 @@ Open a secondary terminal window or execute queries using the built-in browser i
 ## Method A: Terminal (Curl Commands)
 Step 1: Upload and Index Documents
 
-curl -X POST "127.0.0.1:8000/upload" -F "file=@docs/System Design Interview prep.docx"
+curl -X POST "127.0.0.1:8000/upload" -F "file=@docs/file.docx"
 
 Result: Automatically extracts document chunks, commits the vector matrix down to faiss_index/, and warms up your QA pipeline.
 Step 2: Execute Semantic Context Queries
@@ -113,7 +113,4 @@ curl -X POST "127.0.0.1:8000/ask" \
 * Enhance formatting logic to output Source Citations or relevant fallback errors if data is absent.
 * Interface with live web scrapers to deliver hybrid internet search fallbacks.
 * Support specialized memory layers splitting Short-Term Context vs. Long-Term Context.
-
-------------------------------
-Would you like help mapping out any of the advanced features from the ToDo roadmap, such as implementing a Streamlit User Interface or setting up Prompt Injection Guardrails?
 
