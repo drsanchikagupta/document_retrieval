@@ -1,4 +1,5 @@
 ## Local RAG Pipeline with FastAPI, FAISS, & Ollama
+
 This project implements a fully local, privacy-centric Retrieval-Augmented Generation (RAG) pipeline. By combining FastAPI, FAISS, HuggingFace Embeddings, and Ollama (llama3), it processes documents and answers semantic queries entirely on your machine with zero cloud dependencies or API subscription fees.
 ------------------------------
 ## 🛠️ Architecture Stack Comparison
