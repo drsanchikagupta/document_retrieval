@@ -3,8 +3,13 @@ import time
 import json
 import logging
 from contextlib import asynccontextmanager
+from typing import List
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
+
+# 1. Load environment variables FIRST before importing any LangChain/Langfuse tools
+from dotenv import load_dotenv
+load_dotenv()
 
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -13,8 +18,8 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain.chains import RetrievalQA
 
-# Import Langfuse's native callback handler for LangChain
-from langfuse.callback import CallbackHandler
+# Import Langfuse integration (Targeting the modern LangChain namespace)
+from langfuse.langchain import CallbackHandler
 
 #-----logging configuration-----
 logging.basicConfig(
@@ -101,10 +106,6 @@ async def lifespan(app: FastAPI):
 
     state["llm"] = llm
     yield
-    # Ensure all remaining background tracking logs are pushed out on shutdown
-    if "langfuse_handler" in state:
-        logger.info("Flushing background monitoring traces...")
-        state["langfuse_handler"].flush() [1.21]
     state.clear()
 
 app = FastAPI(lifespan=lifespan)
@@ -112,47 +113,110 @@ app = FastAPI(lifespan=lifespan)
 class QueryRequest(BaseModel):
     question: str
 
+class FolderRequest(BaseModel):
+    folder_path: str
+
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
+async def upload_documents(files: List[UploadFile] = File(...)):
     embeddings = state.get("embeddings")
     if not embeddings:
         raise HTTPException(status_code=503, detail="Embeddings engine unavailable.")
 
-    file_ext = os.path.splitext(file.filename).lower()
-    if file_ext not in [".docx", ".pdf", ".txt", ".md"]:
-        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_ext}")
-
+    uploaded_summary = []
     import tempfile
     import shutil
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
-        shutil.copyfileobj(file.file, temp_file)
-        temp_file_path = temp_file.name
 
-    try:
-        chunks = load_and_split_documents(temp_file_path, file_ext)
-        if not chunks:
-            raise HTTPException(status_code=400, detail="Failed to parse document text.")
+    for file in files:
+        file_ext = os.path.splitext(file.filename).lower()
+        if file_ext not in [".docx", ".pdf", ".txt", ".md"]:
+            logger.warning(f"Skipping unsupported file type: {file.filename}")
+            continue
 
-        if state.get("vector_store") is not None:
-            logger.info("Adding chunks to existing local vector index...")
-            state["vector_store"].add_documents(chunks)
-        else:
-            state["vector_store"] = create_vector_store(chunks, embeddings)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+            shutil.copyfileobj(file.file, temp_file)
+            temp_file_path = temp_file.name
 
+        try:
+            chunks = load_and_split_documents(temp_file_path, file_ext)
+            if not chunks:
+                continue
+
+            if state.get("vector_store") is not None:
+                logger.info(f"Adding chunks from {file.filename} to universal index...")
+                state["vector_store"].add_documents(chunks)
+            else:
+                logger.info(f"Creating baseline universal index with {file.filename}...")
+                state["vector_store"] = create_vector_store(chunks, embeddings)
+
+            uploaded_summary.append(file.filename)
+
+        finally:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+
+    if state.get("vector_store") is not None:
         state["vector_store"].save_local(INDEX_PATH)
-        logger.info(f"Vector store created and saved successfully.")
-
         state["qa_chain"] = RetrievalQA.from_chain_type(
             llm=state["llm"],
             chain_type="stuff",
             retriever=state["vector_store"].as_retriever(search_kwargs={"k": 3})
         )
+        return {"status": "success", "message": f"Successfully indexed: {', '.join(uploaded_summary)}"}
+    
+    raise HTTPException(status_code=400, detail="No valid documents were successfully processed.")
 
-        return {"status": "success", "message": f"Successfully indexed {file.filename}"}
+@app.post("/upload-folder")
+async def upload_entire_folder(request: FolderRequest):
+    embeddings = state.get("embeddings")
+    if not embeddings:
+        raise HTTPException(status_code=503, detail="Embeddings engine unavailable.")
 
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+    if not os.path.exists(request.folder_path):
+        raise HTTPException(status_code=404, detail=f"The system directory path does not exist: {request.folder_path}")
+
+    indexed_files = []
+    
+    # Scan the target folder for matching formats
+    for filename in os.listdir(request.folder_path):
+        file_path = os.path.join(request.folder_path, filename)
+        
+        # Skip sub-directories, focus strictly on files
+        if os.path.isdir(file_path):
+            continue
+            
+        file_ext = os.path.splitext(filename).lower()
+        if file_ext not in [".docx", ".pdf", ".txt", ".md"]:
+            continue
+
+        try:
+            # Parse documents natively directly from their local directory paths
+            chunks = load_and_split_documents(file_path, file_ext)
+            if not chunks:
+                continue
+
+            if state.get("vector_store") is not None:
+                logger.info(f"Adding folder file chunks from {filename} into universal index...")
+                state["vector_store"].add_documents(chunks)
+            else:
+                logger.info(f"Creating baseline universal index with folder file {filename}...")
+                state["vector_store"] = create_vector_store(chunks, embeddings)
+                
+            indexed_files.append(filename)
+        except Exception as e:
+            logger.error(f"Error indexing file {filename} from folder: {str(e)}")
+
+    if not indexed_files:
+        raise HTTPException(status_code=400, detail="No valid documents matching supported formats (.pdf, .docx, .txt, .md) found in folder.")
+
+    # Commit all compiled folder additions to storage once loop resolves
+    state["vector_store"].save_local(INDEX_PATH)
+    state["qa_chain"] = RetrievalQA.from_chain_type(
+        llm=state["llm"],
+        chain_type="stuff",
+        retriever=state["vector_store"].as_retriever(search_kwargs={"k": 3})
+    )
+
+    return {"status": "success", "message": f"Successfully batch indexed {len(indexed_files)} files from folder.", "files": indexed_files}
 
 @app.post("/ask")
 async def ask_question(request: QueryRequest):
@@ -163,10 +227,10 @@ async def ask_question(request: QueryRequest):
         start_total = time.time()
         query = request.question
         
-        # 1. Initialize Langfuse dynamic callbacks on-demand per request
+        # Initialize Langfuse dynamic callbacks on-demand per request
         langfuse_handler = CallbackHandler()
         
-        # 2. Measure Retrieval Latency & extract context chunks
+        # Measure Retrieval Latency & extract context chunks
         start_retrieval = time.time()
         logger.info(f"Retrieving relevant chunks for query: '{query}'")
         relevant_chunks = state["vector_store"].similarity_search(query, k=3)
@@ -175,23 +239,23 @@ async def ask_question(request: QueryRequest):
         # Format the retrieved texts for the Ragas pipeline requirement
         contexts = [chunk.page_content for chunk in relevant_chunks]
         
-        # 3. Measure Generation Latency passing the Langfuse callback directly to the invocation loop
+        # Measure Generation Latency passing the Langfuse callback directly to the invocation loop
         start_generation = time.time()
         response = state["qa_chain"].invoke(
             query, 
-            config={"callbacks": [langfuse_handler]} # Hooks everything into your Langfuse UI automatically
+            config={"callbacks": [langfuse_handler]}
         )
         generation_latency = round(time.time() - start_generation, 3)
         
         total_latency = round(time.time() - start_total, 3)
         answer = response["result"]
 
-        # 4. Construct dataset record strictly matching the evaluation format for Ragas
+        # Construct dataset record strictly matching the evaluation format for Ragas
         eval_record = {
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "question": query,          # Maps to Ragas 'question'
-            "answer": answer,            # Maps to Ragas 'answer'
-            "contexts": contexts,        # Maps to Ragas 'contexts'
+            "question": query,
+            "answer": answer,
+            "contexts": contexts,
             "metrics": {
                 "retrieval_latency_seconds": retrieval_latency,
                 "generation_latency_seconds": generation_latency,
@@ -199,11 +263,14 @@ async def ask_question(request: QueryRequest):
             }
         }
 
-        # 5. Append-only file writer ('a' flag ensures data is preserved and not overwritten)
+        # Append-only file writer ('a' flag ensures data is preserved and not overwritten)
         with open(RAGAS_EVAL_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(eval_record) + "\n")
 
         logger.info(f"Log appended to {RAGAS_EVAL_FILE}. Total latency: {total_latency}s")
+        
+        # Force the underlying client to push traces immediately
+        langfuse_handler.client.flush()
         
         return {
             "question": query,
@@ -213,4 +280,3 @@ async def ask_question(request: QueryRequest):
     except Exception as e:
         logger.error(f"Error handling query: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error.")
-
